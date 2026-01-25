@@ -5,15 +5,37 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 # Initialize Pygame
+pygame.mixer.pre_init(44100, -16, 2, 512)
 pygame.init()
+try:
+    pygame.mixer.init()
+except Exception as e:
+    print(f"Audio init failed: {e}")
 
 # Constants
 WINDOW_WIDTH = 1400
 WINDOW_HEIGHT = 900
 TILE_WIDTH = 80
 TILE_HEIGHT = 100
+DOMINO_INSET_X = 0
+DOMINO_INSET_Y = 0
+DOMINO_WIDTH = TILE_WIDTH - (DOMINO_INSET_X * 2)
+DOMINO_HEIGHT = TILE_HEIGHT - (DOMINO_INSET_Y * 2)
+DOMINO_SPACING_PAD_X = -35  # tighten horizontal gap
+DOMINO_SPACING_PAD_Y = -20  # vertical spacing (already good)
+GRID_STEP_X = DOMINO_WIDTH + DOMINO_SPACING_PAD_X
+GRID_STEP_Y = DOMINO_HEIGHT + DOMINO_SPACING_PAD_Y
+CAST_SHADOW_ALPHA = 110
+CAST_SHADOW_OFFSET_X = 4
+CAST_SHADOW_OFFSET_Y = 4
+LAYER_OFFSET_X = 6
+LAYER_OFFSET_Y = 5
 TILE_DEPTH = 8  # 3D effect depth
 FPS = 60
 
@@ -59,52 +81,84 @@ class Tile:
         self.pos = pos
         self.character_id = character_id
         self.image = image
+        self.mask = None
+        self.mask_surface = None
+        self.mask_outline = []
         self.is_selected = False
         self.is_hint = False
         self.render_x = 0
         self.render_y = 0
         self.animation_offset = 0
+        self.shake_offset_x = 0
+        self.shake_time = 0
+        self.refresh_mask()
+
+    def refresh_mask(self):
+        """Rebuild mask data after image changes."""
+        if not self.image:
+            self.mask = None
+            self.mask_surface = None
+            self.mask_outline = []
+            return
+        self.mask = pygame.mask.from_surface(self.image)
+        self.mask_surface = self.mask.to_surface(
+            setcolor=(255, 255, 255, 255),
+            unsetcolor=(0, 0, 0, 0)
+        )
+        self.mask_outline = self.mask.outline()
+
+    def has_adjacent_stack(self, tiles_dict: dict) -> bool:
+        """Check if any neighboring tile is on a higher layer."""
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                pos = TilePosition(self.pos.x + dx, self.pos.y + dy, self.pos.z + 1)
+                if pos in tiles_dict:
+                    return True
+        return False
         
     def get_screen_pos(self, offset_x: int, offset_y: int) -> Tuple[int, int]:
         """Calculate screen position with 3D offset"""
-        base_x = offset_x + self.pos.x * (TILE_WIDTH // 2)
-        base_y = offset_y + self.pos.y * (TILE_HEIGHT // 2)
+        # Space based on the actual visible domino so tiles touch cleanly
+        spacing_x = GRID_STEP_X
+        spacing_y = GRID_STEP_Y
         
-        # Add 3D depth effect
-        depth_offset = self.pos.z * TILE_DEPTH
+        base_x = int(offset_x + self.pos.x * spacing_x)
+        base_y = int(offset_y + self.pos.y * spacing_y)
         
-        self.render_x = base_x - depth_offset
-        self.render_y = base_y - depth_offset
+        # 3D depth effect - offset to the RIGHT and UP for stacked tiles
+        depth_offset_x = self.pos.z * LAYER_OFFSET_X
+        depth_offset_y = self.pos.z * LAYER_OFFSET_Y
+        
+        self.render_x = int(base_x - depth_offset_x)
+        self.render_y = int(base_y - depth_offset_y)
         
         return self.render_x, self.render_y
     
     def is_blocked_left(self, tiles_dict: dict) -> bool:
         """Check if tile is blocked on the left - adjacent tile on same layer"""
         # A tile at this layer directly to the left
-        for dy in [-1, 0, 1]:
-            left_pos = TilePosition(self.pos.x - 2, self.pos.y + dy, self.pos.z)
-            if left_pos in tiles_dict:
-                return True
+        left_pos = TilePosition(self.pos.x - 1, self.pos.y, self.pos.z)
+        if left_pos in tiles_dict:
+            return True
         return False
     
     def is_blocked_right(self, tiles_dict: dict) -> bool:
         """Check if tile is blocked on the right - adjacent tile on same layer"""
         # A tile at this layer directly to the right
-        for dy in [-1, 0, 1]:
-            right_pos = TilePosition(self.pos.x + 2, self.pos.y + dy, self.pos.z)
-            if right_pos in tiles_dict:
-                return True
+        right_pos = TilePosition(self.pos.x + 1, self.pos.y, self.pos.z)
+        if right_pos in tiles_dict:
+            return True
         return False
     
     def is_blocked_top(self, tiles_dict: dict) -> bool:
         """Check if tile has another tile on top covering it"""
         # Check if any tile one layer above overlaps with this tile's area
         # A tile above must overlap to cover - check a 3x3 grid around our position
-        for dy in [-1, 0, 1]:
-            for dx in [-1, 0, 1]:
-                top_pos = TilePosition(self.pos.x + dx, self.pos.y + dy, self.pos.z + 1)
-                if top_pos in tiles_dict:
-                    return True
+        top_pos = TilePosition(self.pos.x, self.pos.y, self.pos.z + 1)
+        if top_pos in tiles_dict:
+            return True
         return False
     
     def is_free(self, tiles_dict: dict) -> bool:
@@ -123,77 +177,98 @@ class Tile:
         
         return True
     
-    def draw(self, screen: pygame.Surface, tiles_dict: dict = None, is_hovered: bool = False):
-        """Draw the domino tile with hover effects"""
-        x, y = self.render_x, self.render_y
+    def shake(self):
+        """Trigger a shake animation for unavailable tile"""
+        self.shake_time = pygame.time.get_ticks()
+    
+    def update_shake(self):
+        """Update shake animation"""
+        if self.shake_time > 0:
+            elapsed = pygame.time.get_ticks() - self.shake_time
+            if elapsed < 300:  # Shake for 300ms
+                # Create shake effect - oscillate back and forth
+                progress = elapsed / 300.0
+                self.shake_offset_x = int(10 * (1 - progress) * (1 if (elapsed // 50) % 2 == 0 else -1))
+            else:
+                self.shake_offset_x = 0
+                self.shake_time = 0
+    
+    def draw(self, screen: pygame.Surface, tiles_dict: dict = None, is_hovered: bool = False, max_z: int = 0):
+        """Draw the domino tile - just the image"""
+        self.update_shake()
+        
+        x, y = self.render_x + self.shake_offset_x, self.render_y
         y += self.animation_offset
         
         # Check if tile is free (clickable)
         is_free = tiles_dict is None or self.is_free(tiles_dict)
         
-        # Draw green glow for hovered usable tiles - very tight to fit domino
-        if is_hovered and is_free:
-            glow_surf = pygame.Surface((TILE_WIDTH + 6, TILE_HEIGHT + 6), pygame.SRCALPHA)
-            for i in range(3, 0, -1):
-                alpha = int(100 * (i / 3))
-                glow_color = (50, 255, 100, alpha)
-                pygame.draw.rect(glow_surf, glow_color, (3-i, 3-i, TILE_WIDTH + i*2, TILE_HEIGHT + i*2), border_radius=4)
-            screen.blit(glow_surf, (x - 3, y - 3))
+        # Actual domino dimensions (accounting for transparent padding)
+        domino_width = DOMINO_WIDTH
+        domino_height = DOMINO_HEIGHT
+        domino_x = x + DOMINO_INSET_X
+        domino_y = y + DOMINO_INSET_Y
         
-        # Draw shadow for depth
-        shadow_surf = pygame.Surface((TILE_WIDTH + 6, TILE_HEIGHT + 6), pygame.SRCALPHA)
-        pygame.draw.rect(shadow_surf, (0, 0, 0, 80), (0, 0, TILE_WIDTH + 6, TILE_HEIGHT + 6), border_radius=4)
-        screen.blit(shadow_surf, (x + 4, y + 4))
+        # Draw green glow for hovered usable tiles - mask to domino shape
+        if is_hovered and is_free and self.mask_outline:
+            glow_surf = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+            for width, alpha in [(8, 40), (6, 70), (4, 110)]:
+                pygame.draw.lines(glow_surf, (50, 255, 100, alpha), True, self.mask_outline, width)
+            screen.blit(glow_surf, (x, y))
         
-        # Draw the domino image directly
+        # Draw the domino image directly - NO greyscale, always full color
         if self.image:
-            # Calculate darkness based on whether tile is usable
-            if is_free or self.is_selected or self.is_hint:
-                greyed_out = False
-            else:
-                # Tile is blocked - apply grey effect
-                greyed_out = True
-            
+            # Shadows for depth readability (masked to the domino shape)
+            if self.mask_surface:
+                # Lower tiles get a bit more shadow to separate layers visually
+                depth_factor = max(0, max_z - self.pos.z)
+                base_alpha = 40
+                extra_alpha = min(depth_factor * 12, 80)
+                shadow_alpha = base_alpha + extra_alpha
+                shadow = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+                shadow.fill((0, 0, 0, shadow_alpha))
+                shadow.blit(self.mask_surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+                screen.blit(shadow, (x + 2, y + 2))
+
             image_rect = self.image.get_rect(topleft=(x, y))
+            screen.blit(self.image, image_rect)
             
-            # Apply greyscale to blocked tiles - keep solid, not transparent
-            if greyed_out and not self.is_selected and not self.is_hint:
-                # Create greyed out version of the image - fully opaque
-                greyed_image = self.image.copy()
-                
-                # Convert to greyscale using a more subtle approach
-                # Create a greyscale overlay that desaturates
-                pixel_array = pygame.surfarray.pixels3d(greyed_image)
-                # Convert to greyscale but keep it visible
-                grey_values = (pixel_array[:, :, 0] * 0.3 + 
-                              pixel_array[:, :, 1] * 0.59 + 
-                              pixel_array[:, :, 2] * 0.11).astype('uint8')
-                pixel_array[:, :, 0] = grey_values
-                pixel_array[:, :, 1] = grey_values
-                pixel_array[:, :, 2] = grey_values
-                del pixel_array  # Unlock the surface
-                
-                # Darken slightly but keep opaque
-                dark_overlay = pygame.Surface((greyed_image.get_width(), greyed_image.get_height()), pygame.SRCALPHA)
-                dark_overlay.fill((0, 0, 0, 60))  # Subtle darkening, not heavy
-                greyed_image.blit(dark_overlay, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
-                
-                screen.blit(greyed_image, image_rect)
-            else:
-                screen.blit(self.image, image_rect)
+            # Grey shade for tiles that cannot be pressed (mask to shape)
+            if tiles_dict is not None and not is_free and self.mask_surface:
+                shade = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+                shade.fill((0, 0, 0, 70))
+                shade.blit(self.mask_surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+                screen.blit(shade, (x, y))
+
             
-            # Draw selection/hint border over the domino - slightly inset to fit
-            if self.is_selected:
-                border_rect = pygame.Rect(x + 2, y + 2, TILE_WIDTH - 4, TILE_HEIGHT - 4)
-                pygame.draw.rect(screen, (255, 180, 0), border_rect, 3, border_radius=4)
-            elif self.is_hint:
-                border_rect = pygame.Rect(x + 2, y + 2, TILE_WIDTH - 4, TILE_HEIGHT - 4)
-                pygame.draw.rect(screen, (50, 200, 100), border_rect, 3, border_radius=4)
+            # Subtle top-edge highlight for stacked tiles
+            if self.pos.z > 0 and self.mask_outline:
+                highlight = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+                pygame.draw.lines(highlight, (255, 255, 255, 90), True, self.mask_outline, 2)
+                screen.blit(highlight, (x, y - 1))
+
+            # Draw gold border for selected tiles - masked to domino outline
+            if self.is_selected and self.mask_outline:
+                border_surf = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+                pygame.draw.lines(border_surf, (255, 215, 0, 220), True, self.mask_outline, 4)
+                screen.blit(border_surf, (x, y))
+            elif self.is_hint and self.mask_outline:
+                border_surf = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+                pygame.draw.lines(border_surf, (50, 255, 100, 220), True, self.mask_outline, 4)
+                screen.blit(border_surf, (x, y))
     
     def contains_point(self, px: int, py: int) -> bool:
         """Check if point is inside tile"""
-        return (self.render_x <= px <= self.render_x + TILE_WIDTH and
-                self.render_y <= py <= self.render_y + TILE_HEIGHT)
+        if not (self.render_x <= px <= self.render_x + TILE_WIDTH and
+                self.render_y <= py <= self.render_y + TILE_HEIGHT):
+            return False
+        if not self.mask:
+            return True
+        local_x = int(px - self.render_x)
+        local_y = int(py - self.render_y)
+        if local_x < 0 or local_y < 0 or local_x >= TILE_WIDTH or local_y >= TILE_HEIGHT:
+            return False
+        return self.mask.get_at((local_x, local_y)) == 1
 
 class Button:
     def __init__(self, x: int, y: int, width: int, height: int, text: str, 
@@ -276,6 +351,8 @@ class Button:
             self.is_hovered = self.rect.collidepoint(event.pos)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.is_hovered:
+                if self.game and hasattr(self.game, "play_sound"):
+                    self.game.play_sound(self.game.button_press_sound)
                 return True
         return False
 
@@ -300,12 +377,13 @@ class MahjongGame:
         # Load resources
         self.load_dominos()
         self.load_backgrounds()
+        self.load_sounds()
         
         # Levels with updated names
         self.levels = [
             Level("Turtle", self.create_pyramid_layout, "Easy"),
-            Level("Tri-Peaks", self.create_temple_layout, "Medium"),
-            Level("Butterfly", self.create_dragon_layout, "Hard")
+            Level("Temple", self.create_temple_layout, "Medium"),
+            Level("Diamond Peaks", self.create_dragon_layout, "Hard")
         ]
         self.current_level_index = 0
         
@@ -351,10 +429,13 @@ class MahjongGame:
         self.mix_button = Button(WINDOW_WIDTH - 240, 280, 220, 65, "MIX", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
         self.restart_button = Button(WINDOW_WIDTH - 240, 360, 220, 65, "RESTART", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
         
-        # End screen buttons
-        self.next_level_button = Button(center_x - 250, 500, 220, 70, "NEXT LEVEL", BUTTON_PRIMARY, BUTTON_PRIMARY_HOVER, self)
-        self.retry_button = Button(center_x + 30, 500, 220, 70, "RETRY", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
-        self.menu_button = Button(center_x - 110, 600, 220, 60, "MENU", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
+        # End screen buttons - larger buttons with smaller text
+        self.next_level_button = Button(center_x - 320, 500, 280, 80, "NEXT LEVEL", BUTTON_PRIMARY, BUTTON_PRIMARY_HOVER, self)
+        self.retry_button = Button(center_x + 40, 500, 280, 80, "RETRY", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
+        self.menu_button = Button(center_x - 140, 610, 280, 70, "MENU", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
+
+        # Mute button (top-right, all screens)
+        self.mute_button = Button(WINDOW_WIDTH - 180, 20, 140, 50, "MUTE", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
         
     def load_fonts(self):
         """Load custom fonts"""
@@ -439,203 +520,259 @@ class MahjongGame:
             )
             pygame.draw.line(background, color, (0, y), (WINDOW_WIDTH, y))
         return background
+
+    def load_sounds(self):
+        """Load sound effects"""
+        self.audio_enabled = pygame.mixer.get_init() is not None
+        self.is_muted = False
+        self.music_volume = 0.3
+        self.sound_volume = 0.7
+        self.domino_click1_sound = None
+        self.domino_click2_sound = None
+        self.incorrect_domino_sound = None
+        self.correct_domino_sound = None
+        self.level_win_sound = None
+        self.button_press_sound = None
+
+        sounds_path = Path("src/sounds")
+        if not self.audio_enabled:
+            return
+
+        def load_sound(*paths: Path):
+            for path in paths:
+                if path and path.exists():
+                    try:
+                        sfx = pygame.mixer.Sound(str(path))
+                        sfx.set_volume(self.sound_volume)
+                        return sfx
+                    except Exception as e:
+                        print(f"Error loading sound {path.name}: {e}")
+            return None
+
+        self.domino_click1_sound = load_sound(sounds_path / "domino_click1.wav")
+        self.domino_click2_sound = load_sound(sounds_path / "domino_click2.wav")
+        self.incorrect_domino_sound = load_sound(sounds_path / "incorrect_domino.wav")
+        self.correct_domino_sound = load_sound(sounds_path / "correct_domino.wav")
+        self.level_win_sound = load_sound(sounds_path / "level_win.wav", sounds_path / "level_win.ogg", sounds_path / "level_win.mp4")
+        self.button_press_sound = load_sound(sounds_path / "button_press.wav", sounds_path / "button_press.ogg", sounds_path / "button_press.mp4")
+
+        # Load background music with fallbacks
+        for music_path in (
+            sounds_path / "main_music.mp3",
+            sounds_path / "main_music.ogg",
+            sounds_path / "main_music.wav",
+        ):
+            if music_path.exists():
+                try:
+                    pygame.mixer.music.load(str(music_path))
+                    pygame.mixer.music.set_volume(self.music_volume)
+                    pygame.mixer.music.play(-1)
+                except Exception as e:
+                    print(f"Error loading music {music_path.name}: {e}")
+                break
+
+    def play_sound(self, sound):
+        if sound and not self.is_muted:
+            try:
+                sound.play()
+            except Exception:
+                pass
+
+    def toggle_mute(self):
+        if not self.audio_enabled:
+            return
+        self.is_muted = not self.is_muted
+        if self.is_muted:
+            pygame.mixer.music.set_volume(0.0)
+            for s in (self.domino_click1_sound, self.domino_click2_sound, self.incorrect_domino_sound, self.correct_domino_sound, self.level_win_sound, self.button_press_sound):
+                if s:
+                    s.set_volume(0.0)
+        else:
+            pygame.mixer.music.set_volume(self.music_volume)
+            for s in (self.domino_click1_sound, self.domino_click2_sound, self.incorrect_domino_sound, self.correct_domino_sound, self.level_win_sound, self.button_press_sound):
+                if s:
+                    s.set_volume(self.sound_volume)
+
+    def draw_mute_button(self):
+        self.mute_button.text = "UNMUTE" if self.is_muted else "MUTE"
+        self.mute_button.draw(self.screen, self.tiny_font, self.tiny_font)
     
     def load_dominos(self):
-        """Load all domino images from dominos folder"""
+        """Load domino images from dominos folder"""
         self.domino_images = []
         dominos_path = Path("src/dominos")
         
-        # Load dominos in sorted order to maintain consistency
-        domino_files = sorted(dominos_path.glob("*.png"))
-        
+        # Load the new domino images in a fixed order to keep IDs consistent
+        ordered_names = [
+            "bullyDomino.png",
+            "casDomino.png",
+            "cherieDomino.png",
+            "cyborgDomino.png",
+            "giuseppeDomino.png",
+            "jackDomino.png",
+            "jackieDomino.png",
+            "jasonDomino.png",
+            "minaDomino.png",
+            "princeDomino.png",
+            "spencerDomino.png",
+            "traceDomino.png",
+        ]
+        domino_files = []
+        for name in ordered_names:
+            path = dominos_path / name
+            if not path.exists():
+                print(f"Missing domino image: {name}")
+            else:
+                domino_files.append(path)
+
         for domino_file in domino_files:
             try:
-                image = pygame.image.load(str(domino_file))
-                # Scale domino to exact tile size - the images ARE the tiles
-                image = pygame.transform.smoothscale(image, (TILE_WIDTH, TILE_HEIGHT))
+                image = self._prepare_domino_image(domino_file)
+
                 self.domino_images.append(image)
                 print(f"Loaded {domino_file.name}")
             except Exception as e:
                 print(f"Error loading {domino_file}: {e}")
         
         print(f"Loaded {len(self.domino_images)} domino images")
-        
+
+    def _prepare_domino_image(self, domino_file: Path) -> pygame.Surface:
+        """Resize to standard tile size without cropping."""
+        if Image is not None:
+            pil_image = Image.open(domino_file).convert("RGBA")
+            pil_image = pil_image.resize((TILE_WIDTH, TILE_HEIGHT), Image.LANCZOS)
+            mode = pil_image.mode
+            size = pil_image.size
+            data = pil_image.tobytes()
+            return pygame.image.fromstring(data, size, mode).convert_alpha()
+        else:
+            image = pygame.image.load(str(domino_file)).convert_alpha()
+            return pygame.transform.smoothscale(image, (TILE_WIDTH, TILE_HEIGHT))
+
     def create_pyramid_layout(self) -> List[TilePosition]:
-        """Create simple symmetrical pyramid - Easy level"""
+        """Easy level - Turtle shape (~90 tiles, 3 layers)"""
         positions = []
+        occupied = set()
         
-        # Simple pyramid - 5 layers, symmetrical
-        # Layer 0 (base) - 7x7
-        for y in range(0, 14, 2):
-            for x in range(0, 14, 2):
-                positions.append(TilePosition(x, y, 0))
+        def add_tile(tx: int, ty: int, z: int):
+            key = (tx, ty, z)
+            if key not in occupied:
+                occupied.add(key)
+                positions.append(TilePosition(tx, ty, z))
         
-        # Layer 1 - 5x5
-        for y in range(2, 12, 2):
-            for x in range(2, 12, 2):
-                positions.append(TilePosition(x, y, 1))
+        def add_rect(x0: int, y0: int, w: int, h: int, z: int):
+            for ty in range(y0, y0 + h):
+                for tx in range(x0, x0 + w):
+                    add_tile(tx, ty, z)
         
-        # Layer 2 - 3x3
-        for y in range(4, 10, 2):
-            for x in range(4, 10, 2):
-                positions.append(TilePosition(x, y, 2))
+        # Core turtle shell (84 tiles)
+        # Layer 0: 9x6
+        add_rect(0, 0, 9, 6, 0)
+        # Layer 1: 6x4 centered
+        add_rect(1, 1, 6, 4, 1)
+        # Layer 2: 3x2 centered
+        add_rect(3, 2, 3, 2, 2)
         
-        # Layer 3 - 2x2
-        for y in range(5, 9, 2):
-            for x in range(5, 9, 2):
-                positions.append(TilePosition(x, y, 3))
-        
-        # Layer 4 (top) - 1 tile
-        positions.append(TilePosition(6, 6, 4))
+        # Add side legs to reach 90 tiles (3 per side)
+        add_rect(-1, 2, 1, 3, 0)
+        add_rect(9, 2, 1, 3, 0)
         
         return positions
     
     def create_temple_layout(self) -> List[TilePosition]:
-        """Create three symmetrical pyramids (Tri-Peaks) - Medium level"""
-        positions = []
-        
-        # Left pyramid - 4 layers
-        # Layer 0 - 3x3 base
-        for y in range(8, 14, 2):
-            for x in range(2, 8, 2):
-                positions.append(TilePosition(x, y, 0))
-        # Layer 1 - 2x2
-        for y in range(9, 13, 2):
-            for x in range(3, 7, 2):
-                positions.append(TilePosition(x, y, 1))
-        # Layer 2 - 1x1
-        positions.append(TilePosition(4, 10, 2))
-        # Peak
-        positions.append(TilePosition(4, 10, 3))
-        
-        # Middle pyramid - 4 layers
-        # Layer 0 - 3x3 base
-        for y in range(8, 14, 2):
-            for x in range(11, 17, 2):
-                positions.append(TilePosition(x, y, 0))
-        # Layer 1 - 2x2
-        for y in range(9, 13, 2):
-            for x in range(12, 16, 2):
-                positions.append(TilePosition(x, y, 1))
-        # Layer 2 - 1x1
-        positions.append(TilePosition(13, 10, 2))
-        # Peak
-        positions.append(TilePosition(13, 10, 3))
-        
-        # Right pyramid - 4 layers
-        # Layer 0 - 3x3 base
-        for y in range(8, 14, 2):
-            for x in range(20, 26, 2):
-                positions.append(TilePosition(x, y, 0))
-        # Layer 1 - 2x2
-        for y in range(9, 13, 2):
-            for x in range(21, 25, 2):
-                positions.append(TilePosition(x, y, 1))
-        # Layer 2 - 1x1
-        positions.append(TilePosition(22, 10, 2))
-        # Peak
-        positions.append(TilePosition(22, 10, 3))
-        
-        return positions
+        """Medium level - Temple layout (~88-90 tiles, 3 layers)"""
+        layout = [
+            # === LAYER 0 (Bottom) ===
+            # Top row
+            (0, 0, 0), (2, 0, 0), (4, 0, 0), (6, 0, 0), (8, 0, 0), (10, 0, 0), (12, 0, 0), (14, 0, 0),
+            # Second row
+            (1, 1, 0), (3, 1, 0), (5, 1, 0), (7, 1, 0), (9, 1, 0), (11, 1, 0), (13, 1, 0),
+            # Third row (main body)
+            (0, 2, 0), (1, 2, 0), (2, 2, 0), (3, 2, 0), (4, 2, 0), (5, 2, 0), (6, 2, 0),
+            (7, 2, 0), (8, 2, 0), (9, 2, 0), (10, 2, 0), (11, 2, 0), (12, 2, 0), (13, 2, 0),
+            (14, 2, 0),
+            # Fourth row (main body)
+            (1, 3, 0), (2, 3, 0), (3, 3, 0), (4, 3, 0), (5, 3, 0), (6, 3, 0), (7, 3, 0),
+            (8, 3, 0), (9, 3, 0), (10, 3, 0), (11, 3, 0), (12, 3, 0), (13, 3, 0),
+            # Fifth row (main body)
+            (2, 4, 0), (3, 4, 0), (4, 4, 0), (5, 4, 0), (6, 4, 0), (7, 4, 0),
+            (8, 4, 0), (9, 4, 0), (10, 4, 0), (11, 4, 0), (12, 4, 0),
+            # Sixth row
+            (3, 5, 0), (4, 5, 0), (5, 5, 0), (6, 5, 0), (7, 5, 0), (8, 5, 0),
+            (9, 5, 0), (10, 5, 0), (11, 5, 0),
+            # Bottom row
+            (0, 6, 0), (2, 6, 0), (4, 6, 0), (6, 6, 0), (8, 6, 0), (10, 6, 0), (12, 6, 0),
+            (14, 6, 0),
+
+            # === LAYER 1 (Middle) ===
+            (2, 1, 1), (3, 1, 1), (4, 1, 1), (5, 1, 1), (6, 1, 1), (7, 1, 1), (8, 1, 1),
+            (9, 1, 1), (10, 1, 1), (11, 1, 1), (12, 1, 1),
+            (2, 2, 1), (3, 2, 1), (4, 2, 1), (5, 2, 1), (6, 2, 1), (7, 2, 1), (8, 2, 1),
+            (9, 2, 1), (10, 2, 1), (11, 2, 1), (12, 2, 1),
+            (2, 3, 1), (3, 3, 1), (4, 3, 1), (5, 3, 1), (6, 3, 1), (7, 3, 1), (8, 3, 1),
+            (9, 3, 1), (10, 3, 1), (11, 3, 1), (12, 3, 1),
+            (2, 4, 1), (3, 4, 1), (4, 4, 1), (5, 4, 1), (6, 4, 1), (7, 4, 1), (8, 4, 1),
+            (9, 4, 1), (10, 4, 1), (11, 4, 1), (12, 4, 1),
+            (4, 5, 1), (5, 5, 1), (6, 5, 1), (7, 5, 1), (8, 5, 1), (9, 5, 1), (10, 5, 1),
+
+            # === LAYER 2 (Top) ===
+            (6, 2, 2), (7, 2, 2), (6, 3, 2), (7, 3, 2),
+        ]
+
+        return [TilePosition(x, y, z) for x, y, z in layout]
     
     def create_dragon_layout(self) -> List[TilePosition]:
-        """Create Butterfly layout - Hard level"""
-        positions = []
-        
-        # Center vertical row: 2 wide at bottom, 1 wide for 2 stacks above
-        # Bottom - 2 wide
-        positions.append(TilePosition(13, 10, 0))
-        positions.append(TilePosition(15, 10, 0))
-        # Middle - 1 wide (centered on bottom 2)
-        positions.append(TilePosition(14, 9, 1))
-        # Top - 1 wide
-        positions.append(TilePosition(14, 8, 2))
-        
-        # LEFT WING
-        # Top circle (smaller) - 3 stacks high total
-        # Layer 0 - outer ring
-        left_top_outer = [(6, 6), (8, 6), (10, 6), (6, 8), (10, 8), (6, 10), (8, 10), (10, 10)]
-        for x, y in left_top_outer:
-            positions.append(TilePosition(x, y, 0))
-        
-        # Layer 1 - closer to center
-        left_top_mid = [(7, 7), (9, 7), (7, 9), (9, 9)]
-        for x, y in left_top_mid:
-            positions.append(TilePosition(x, y, 1))
-        
-        # Layer 2 - center with 1 domino stack
-        positions.append(TilePosition(8, 8, 2))
-        
-        # Bottom circle (larger) - 3 stacks high total
-        # Layer 0 - outer ring (larger)
-        left_bottom_outer = [(4, 12), (6, 12), (8, 12), (10, 12), (4, 14), (10, 14), (4, 16), (6, 16), (8, 16), (10, 16)]
-        for x, y in left_bottom_outer:
-            positions.append(TilePosition(x, y, 0))
-        
-        # Layer 1 - closer to center
-        left_bottom_mid = [(5, 13), (7, 13), (9, 13), (5, 15), (9, 15), (7, 15)]
-        for x, y in left_bottom_mid:
-            positions.append(TilePosition(x, y, 1))
-        
-        # Layer 2 - center with 5 domino stack (1 in middle, 1 on each side)
-        # Middle
-        positions.append(TilePosition(7, 14, 2))
-        # Left of middle
-        positions.append(TilePosition(6, 14, 2))
-        # Right of middle
-        positions.append(TilePosition(8, 14, 2))
-        # Add 2 more for 5 total
-        positions.append(TilePosition(7, 13, 2))
-        positions.append(TilePosition(7, 15, 2))
-        
-        # Connecting pieces - 3 stacks high next to center row
-        positions.append(TilePosition(12, 9, 0))
-        positions.append(TilePosition(12, 9, 1))
-        positions.append(TilePosition(12, 9, 2))
-        
-        # RIGHT WING (mirror of left)
-        # Top circle (smaller) - 3 stacks high total
-        # Layer 0 - outer ring
-        right_top_outer = [(18, 6), (20, 6), (22, 6), (18, 8), (22, 8), (18, 10), (20, 10), (22, 10)]
-        for x, y in right_top_outer:
-            positions.append(TilePosition(x, y, 0))
-        
-        # Layer 1 - closer to center
-        right_top_mid = [(19, 7), (21, 7), (19, 9), (21, 9)]
-        for x, y in right_top_mid:
-            positions.append(TilePosition(x, y, 1))
-        
-        # Layer 2 - center with 1 domino stack
-        positions.append(TilePosition(20, 8, 2))
-        
-        # Bottom circle (larger) - 3 stacks high total
-        # Layer 0 - outer ring (larger)
-        right_bottom_outer = [(18, 12), (20, 12), (22, 12), (24, 12), (18, 14), (24, 14), (18, 16), (20, 16), (22, 16), (24, 16)]
-        for x, y in right_bottom_outer:
-            positions.append(TilePosition(x, y, 0))
-        
-        # Layer 1 - closer to center
-        right_bottom_mid = [(19, 13), (21, 13), (23, 13), (19, 15), (23, 15), (21, 15)]
-        for x, y in right_bottom_mid:
-            positions.append(TilePosition(x, y, 1))
-        
-        # Layer 2 - center with 5 domino stack (1 in middle, 1 on each side)
-        # Middle
-        positions.append(TilePosition(21, 14, 2))
-        # Left of middle
-        positions.append(TilePosition(20, 14, 2))
-        # Right of middle
-        positions.append(TilePosition(22, 14, 2))
-        # Add 2 more for 5 total
-        positions.append(TilePosition(21, 13, 2))
-        positions.append(TilePosition(21, 15, 2))
-        
-        # Connecting pieces - 3 stacks high next to center row
-        positions.append(TilePosition(16, 9, 0))
-        positions.append(TilePosition(16, 9, 1))
-        positions.append(TilePosition(16, 9, 2))
-        
-        return positions
+        """Hard level - Double Pyramid/Diamond layout (~88-92 tiles, 5 layers)"""
+        layout = [
+            # === LAYER 0 (Bottom/Base) ===
+            (6, 0, 0), (7, 0, 0), (8, 0, 0),
+            (4, 1, 0), (5, 1, 0), (6, 1, 0), (7, 1, 0), (8, 1, 0), (9, 1, 0), (10, 1, 0),
+            (2, 2, 0), (3, 2, 0), (4, 2, 0), (5, 2, 0), (6, 2, 0), (7, 2, 0), (8, 2, 0),
+            (9, 2, 0), (10, 2, 0), (11, 2, 0), (12, 2, 0),
+            (1, 3, 0), (2, 3, 0), (3, 3, 0), (4, 3, 0), (5, 3, 0), (6, 3, 0), (7, 3, 0),
+            (8, 3, 0), (9, 3, 0), (10, 3, 0), (11, 3, 0), (12, 3, 0), (13, 3, 0),
+            (0, 4, 0), (1, 4, 0), (2, 4, 0), (3, 4, 0), (4, 4, 0), (5, 4, 0), (6, 4, 0),
+            (7, 4, 0), (8, 4, 0), (9, 4, 0), (10, 4, 0), (11, 4, 0), (12, 4, 0),
+            (13, 4, 0), (14, 4, 0),
+            (1, 5, 0), (2, 5, 0), (3, 5, 0), (4, 5, 0), (5, 5, 0), (6, 5, 0), (7, 5, 0),
+            (8, 5, 0), (9, 5, 0), (10, 5, 0), (11, 5, 0), (12, 5, 0), (13, 5, 0),
+            (2, 6, 0), (3, 6, 0), (4, 6, 0), (5, 6, 0), (6, 6, 0), (7, 6, 0), (8, 6, 0),
+            (9, 6, 0), (10, 6, 0), (11, 6, 0), (12, 6, 0),
+            (4, 7, 0), (5, 7, 0), (6, 7, 0), (7, 7, 0), (8, 7, 0), (9, 7, 0), (10, 7, 0),
+            (6, 8, 0), (7, 8, 0), (8, 8, 0),
+
+            # === LAYER 1 (First Inner Layer) ===
+            (5, 1, 1), (6, 1, 1), (7, 1, 1), (8, 1, 1), (9, 1, 1),
+            (3, 2, 1), (4, 2, 1), (5, 2, 1), (6, 2, 1), (7, 2, 1), (8, 2, 1), (9, 2, 1),
+            (10, 2, 1), (11, 2, 1),
+            (2, 3, 1), (3, 3, 1), (4, 3, 1), (5, 3, 1), (6, 3, 1), (7, 3, 1), (8, 3, 1),
+            (9, 3, 1), (10, 3, 1), (11, 3, 1), (12, 3, 1),
+            (2, 4, 1), (3, 4, 1), (4, 4, 1), (5, 4, 1), (6, 4, 1), (7, 4, 1), (8, 4, 1),
+            (9, 4, 1), (10, 4, 1), (11, 4, 1), (12, 4, 1),
+            (2, 5, 1), (3, 5, 1), (4, 5, 1), (5, 5, 1), (6, 5, 1), (7, 5, 1), (8, 5, 1),
+            (9, 5, 1), (10, 5, 1), (11, 5, 1), (12, 5, 1),
+            (3, 6, 1), (4, 6, 1), (5, 6, 1), (6, 6, 1), (7, 6, 1), (8, 6, 1), (9, 6, 1),
+            (10, 6, 1), (11, 6, 1),
+            (5, 7, 1), (6, 7, 1), (7, 7, 1), (8, 7, 1), (9, 7, 1),
+
+            # === LAYER 2 (Second Inner Layer) ===
+            (4, 2, 2), (5, 2, 2), (6, 2, 2), (7, 2, 2), (8, 2, 2), (9, 2, 2), (10, 2, 2),
+            (4, 3, 2), (5, 3, 2), (6, 3, 2), (7, 3, 2), (8, 3, 2), (9, 3, 2), (10, 3, 2),
+            (4, 4, 2), (5, 4, 2), (6, 4, 2), (7, 4, 2), (8, 4, 2), (9, 4, 2), (10, 4, 2),
+            (4, 5, 2), (5, 5, 2), (6, 5, 2), (7, 5, 2), (8, 5, 2), (9, 5, 2), (10, 5, 2),
+            (4, 6, 2), (5, 6, 2), (6, 6, 2), (7, 6, 2), (8, 6, 2), (9, 6, 2), (10, 6, 2),
+
+            # === LAYER 3 (Pre-Peak Layer) ===
+            (5, 3, 3), (6, 3, 3), (7, 3, 3), (8, 3, 3), (9, 3, 3),
+            (5, 4, 3), (6, 4, 3), (7, 4, 3), (8, 4, 3), (9, 4, 3),
+            (5, 5, 3), (6, 5, 3), (7, 5, 3), (8, 5, 3), (9, 5, 3),
+
+            # === LAYER 4 (Twin Peaks) ===
+            (5, 3, 4), (5, 4, 4),
+            (9, 3, 4), (9, 4, 4),
+        ]
+
+        return [TilePosition(x, y, z) for x, y, z in layout]
     
     def create_tiles_from_layout(self, positions: List[TilePosition]):
         """Create tiles from position layout with guaranteed even distribution for winnability"""
@@ -771,6 +908,7 @@ class MahjongGame:
         for i, tile in enumerate(self.tiles):
             tile.character_id = character_ids[i]
             tile.image = self.domino_images[character_ids[i]]
+            tile.refresh_mask()
             tile.is_selected = False
             tile.is_hint = False
         
@@ -780,7 +918,14 @@ class MahjongGame:
         
     def handle_tile_click(self, tile: Tile):
         """Handle clicking on a tile"""
+        # Check if tile is free first
         if not tile.is_free(self.tiles_dict):
+            # Tile is blocked - shake it and deselect any selected tile
+            tile.shake()
+            self.play_sound(self.incorrect_domino_sound)
+            if self.selected_tile:
+                self.selected_tile.is_selected = False
+                self.selected_tile = None
             return
         
         # Clear hints
@@ -791,13 +936,16 @@ class MahjongGame:
             # Select first tile
             tile.is_selected = True
             self.selected_tile = tile
+            self.play_sound(self.domino_click1_sound)
         elif self.selected_tile == tile:
             # Deselect
             tile.is_selected = False
             self.selected_tile = None
         else:
             # Try to match
+            self.play_sound(self.domino_click2_sound)
             if self.selected_tile.character_id == tile.character_id:
+                self.play_sound(self.correct_domino_sound)
                 # Match found! Store in history for undo
                 self.move_history.append((self.selected_tile, tile))
                 
@@ -811,6 +959,7 @@ class MahjongGame:
                 
                 # Check win condition
                 if len(self.tiles) == 0:
+                    self.play_sound(self.level_win_sound)
                     self.game_state = LEVEL_COMPLETE
                 else:
                     self.update_moves_count()
@@ -1108,20 +1257,27 @@ class MahjongGame:
             max_y = max(tile.pos.y for tile in self.tiles)
             max_z = max(tile.pos.z for tile in self.tiles)
             
-            # Calculate pixel bounds considering isometric projection
-            # Each grid unit in X adds TILE_WIDTH // 2, in Y adds TILE_HEIGHT // 2
-            pixel_width = (max_x - min_x) * (TILE_WIDTH // 2) + TILE_WIDTH
-            pixel_height = (max_y - min_y) * (TILE_HEIGHT // 2) + TILE_HEIGHT
+            # Calculate pixel bounds based on actual spacing and layer offsets
+            spacing_x = GRID_STEP_X
+            spacing_y = GRID_STEP_Y
+            min_render_x = float("inf")
+            max_render_x = float("-inf")
+            min_render_y = float("inf")
+            max_render_y = float("-inf")
+            for tile in self.tiles:
+                render_x = tile.pos.x * spacing_x + (tile.pos.z * LAYER_OFFSET_X)
+                render_y = tile.pos.y * spacing_y + (tile.pos.z * LAYER_OFFSET_Y)
+                min_render_x = min(min_render_x, render_x)
+                min_render_y = min(min_render_y, render_y)
+                max_render_x = max(max_render_x, render_x + TILE_WIDTH)
+                max_render_y = max(max_render_y, render_y + TILE_HEIGHT)
             
-            # Add extra space for 3D depth effect
-            depth_offset = max_z * TILE_DEPTH
-            pixel_width += depth_offset
-            pixel_height += depth_offset
+            pixel_width = max_render_x - min_render_x
+            pixel_height = max_render_y - min_render_y
             
             # Calculate offsets to center the layout
-            # Account for min coordinates to position correctly
-            offset_x = (WINDOW_WIDTH - pixel_width) // 2 - min_x * (TILE_WIDTH // 2) + depth_offset
-            offset_y = (WINDOW_HEIGHT - pixel_height) // 2 - min_y * (TILE_HEIGHT // 2) + 80  # Extra space for top UI
+            offset_x = int((WINDOW_WIDTH - pixel_width) // 2 - min_render_x)
+            offset_y = int((WINDOW_HEIGHT - pixel_height) // 2 - min_render_y + 80)  # Extra space for top UI
         else:
             offset_x = WINDOW_WIDTH // 2
             offset_y = WINDOW_HEIGHT // 2
@@ -1129,15 +1285,21 @@ class MahjongGame:
         for tile in self.tiles:
             tile.get_screen_pos(offset_x, offset_y)
         
-        # Sort tiles for proper rendering (back to front, bottom to top)
-        sorted_tiles = sorted(self.tiles, key=lambda t: (t.pos.z, t.render_y, t.render_x))
+        # Sort tiles for proper rendering (back to front, top-right to bottom-left)
+        sorted_tiles = sorted(
+            self.tiles,
+            key=lambda t: (t.pos.z, t.pos.y + t.pos.x, t.pos.y, t.pos.x)
+        )
         
         # Get current mouse position to detect hover
         mouse_pos = pygame.mouse.get_pos()
         self.hovered_tile = None
         
         # Find which tile is being hovered (check top tiles first)
-        sorted_tiles_top_first = sorted(self.tiles, key=lambda t: (-t.pos.z, -t.render_y, -t.render_x))
+        sorted_tiles_top_first = sorted(
+            self.tiles,
+            key=lambda t: (-t.pos.z, -(t.pos.y + t.pos.x), -t.pos.y, -t.pos.x)
+        )
         for tile in sorted_tiles_top_first:
             if tile.contains_point(mouse_pos[0], mouse_pos[1]):
                 if tile.is_free(self.tiles_dict):
@@ -1145,9 +1307,10 @@ class MahjongGame:
                 break
         
         # Draw tiles with depth information and hover state
+        max_z = max(tile.pos.z for tile in self.tiles)
         for tile in sorted_tiles:
             is_hovered = (tile == self.hovered_tile)
-            tile.draw(self.screen, self.tiles_dict, is_hovered)
+            tile.draw(self.screen, self.tiles_dict, is_hovered, max_z)
         
     def draw_level_complete(self):
         """Draw level complete screen"""
@@ -1159,8 +1322,8 @@ class MahjongGame:
         self.screen.blit(overlay, (0, 0))
         
         # Congratulations with background
-        congrats = self.title_font.render("LEVEL COMPLETE!", True, (255, 215, 0))
-        congrats_shadow = self.title_font.render("LEVEL COMPLETE!", True, (0, 0, 0))
+        congrats = self.subtitle_font.render("LEVEL COMPLETE!", True, TEXT_WHITE)
+        congrats_shadow = self.subtitle_font.render("LEVEL COMPLETE!", True, (0, 0, 0))
         
         if self.text_background_original:
             congrats_bg_width = congrats.get_width() + 120
@@ -1209,9 +1372,9 @@ class MahjongGame:
         
         # Buttons
         if self.current_level_index < len(self.levels) - 1:
-            self.next_level_button.draw(self.screen, self.button_font, self.button_font)
-        self.retry_button.draw(self.screen, self.button_font, self.button_font)
-        self.menu_button.draw(self.screen, self.small_font, self.small_font)
+            self.next_level_button.draw(self.screen, self.tiny_font, self.tiny_font)
+        self.retry_button.draw(self.screen, self.tiny_font, self.tiny_font)
+        self.menu_button.draw(self.screen, self.tiny_font, self.tiny_font)
         
     def draw_game_over(self):
         """Draw game over screen"""
@@ -1271,11 +1434,13 @@ class MahjongGame:
                         self.game_state = LEVEL_SELECT
                         
                 elif self.game_state == LEVEL_SELECT:
-                    if self.back_button.handle_event(event):
+                    back_clicked = self.back_button.handle_event(event)
+                    if back_clicked:
                         self.game_state = HOME_SCREEN
-                    for i, btn in enumerate(self.level_buttons):
-                        if btn.handle_event(event):
-                            self.start_level(i)
+                    else:
+                        for i, btn in enumerate(self.level_buttons):
+                            if btn.handle_event(event):
+                                self.start_level(i)
                             
                 elif self.game_state == PLAYING:
                     if self.back_button.handle_event(event):
