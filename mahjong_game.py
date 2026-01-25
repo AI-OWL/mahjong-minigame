@@ -38,6 +38,7 @@ LAYER_OFFSET_X = 6
 LAYER_OFFSET_Y = 5
 TILE_DEPTH = 8  # 3D effect depth
 FPS = 60
+MATCH_REVEAL_DELAY = 500  # ms
 
 # Colors - Modern mobile game palette
 BG_GRADIENT_TOP = (20, 30, 60)
@@ -86,6 +87,13 @@ class Tile:
         self.mask_outline = []
         self.is_selected = False
         self.is_hint = False
+        self.face_up = True
+        self.flip_active = False
+        self.flip_start = 0
+        self.flip_duration = 180  # ms
+        self.flip_from_up = True
+        self.flip_to_up = True
+        self.flip_progress = 1.0
         self.render_x = 0
         self.render_y = 0
         self.animation_offset = 0
@@ -106,6 +114,31 @@ class Tile:
             unsetcolor=(0, 0, 0, 0)
         )
         self.mask_outline = self.mask.outline()
+
+    def set_face_state(self, face_up: bool, animate: bool = True):
+        if not animate:
+            self.face_up = face_up
+            self.flip_active = False
+            self.flip_progress = 1.0
+            return
+        if face_up == self.face_up and not self.flip_active:
+            return
+        self.flip_from_up = self.face_up
+        self.flip_to_up = face_up
+        self.flip_start = pygame.time.get_ticks()
+        self.flip_active = True
+        self.flip_progress = 0.0
+
+    def update_flip(self):
+        if not self.flip_active:
+            return
+        elapsed = pygame.time.get_ticks() - self.flip_start
+        progress = min(1.0, elapsed / self.flip_duration)
+        if progress >= 0.5 and self.face_up == self.flip_from_up:
+            self.face_up = self.flip_to_up
+        self.flip_progress = progress
+        if progress >= 1.0:
+            self.flip_active = False
 
     def has_adjacent_stack(self, tiles_dict: dict) -> bool:
         """Check if any neighboring tile is on a higher layer."""
@@ -193,9 +226,11 @@ class Tile:
                 self.shake_offset_x = 0
                 self.shake_time = 0
     
-    def draw(self, screen: pygame.Surface, tiles_dict: dict = None, is_hovered: bool = False, max_z: int = 0):
+    def draw(self, screen: pygame.Surface, tiles_dict: dict = None, is_hovered: bool = False, max_z: int = 0,
+             face_down_image: pygame.Surface = None):
         """Draw the domino tile - just the image"""
         self.update_shake()
+        self.update_flip()
         
         x, y = self.render_x + self.shake_offset_x, self.render_y
         y += self.animation_offset
@@ -230,8 +265,18 @@ class Tile:
                 shadow.blit(self.mask_surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
                 screen.blit(shadow, (x + 2, y + 2))
 
-            image_rect = self.image.get_rect(topleft=(x, y))
-            screen.blit(self.image, image_rect)
+            image_to_draw = self.image if self.face_up or face_down_image is None else face_down_image
+            if self.flip_active:
+                # Flip animation (scale X to 0 then back)
+                scale_x = abs(1.0 - (self.flip_progress * 2.0))
+                draw_w = max(1, int(TILE_WIDTH * scale_x))
+                draw_h = TILE_HEIGHT
+                scaled = pygame.transform.smoothscale(image_to_draw, (draw_w, draw_h))
+                draw_x = x + (TILE_WIDTH - draw_w) // 2
+                screen.blit(scaled, (draw_x, y))
+            else:
+                image_rect = image_to_draw.get_rect(topleft=(x, y))
+                screen.blit(image_to_draw, image_rect)
             
             # Grey shade for tiles that cannot be pressed (mask to shape)
             if tiles_dict is not None and not is_free and self.mask_surface:
@@ -404,6 +449,11 @@ class MahjongGame:
         
         # Move history for undo
         self.move_history: List[Tuple[Tile, Tile]] = []
+
+        # Pending match/mismatch handling
+        self.pending_tiles: Optional[Tuple[Tile, Tile]] = None
+        self.pending_match: bool = False
+        self.pending_until: int = 0
         
         # Buttons
         self.create_buttons()
@@ -600,6 +650,7 @@ class MahjongGame:
     def load_dominos(self):
         """Load domino images from dominos folder"""
         self.domino_images = []
+        self.face_down_image = None
         dominos_path = Path("src/dominos")
         
         # Load the new domino images in a fixed order to keep IDs consistent
@@ -635,6 +686,15 @@ class MahjongGame:
                 print(f"Error loading {domino_file}: {e}")
         
         print(f"Loaded {len(self.domino_images)} domino images")
+
+        # Load face-down domino for medium/hard levels
+        face_down_path = dominos_path / "face-down-domino.png"
+        if face_down_path.exists():
+            try:
+                self.face_down_image = self._prepare_domino_image(face_down_path)
+                print("Loaded face-down-domino.png")
+            except Exception as e:
+                print(f"Error loading face-down-domino.png: {e}")
 
     def _prepare_domino_image(self, domino_file: Path) -> pygame.Surface:
         """Resize to standard tile size without cropping."""
@@ -829,6 +889,23 @@ class MahjongGame:
             self.tiles_dict[pos] = tile
         
         self.update_moves_count()
+        self.update_face_states()
+
+    def update_face_states(self):
+        """Flip tiles based on level rules."""
+        if self.current_level_index == 0:
+            for tile in self.tiles:
+                tile.set_face_state(True, animate=False)
+            return
+        for tile in self.tiles:
+            if self.pending_tiles and tile in self.pending_tiles:
+                tile.set_face_state(True, animate=False)
+                continue
+            is_free = tile.is_free(self.tiles_dict)
+            if is_free:
+                tile.set_face_state(tile.is_selected or tile.is_hint)
+            else:
+                tile.set_face_state(True)
         
     def start_level(self, level_index: int):
         """Start a specific level"""
@@ -915,9 +992,12 @@ class MahjongGame:
         self.selected_tile = None
         self.mixes_left -= 1
         self.update_moves_count()
+        self.update_face_states()
         
     def handle_tile_click(self, tile: Tile):
         """Handle clicking on a tile"""
+        if self.pending_tiles:
+            return
         # Check if tile is free first
         if not tile.is_free(self.tiles_dict):
             # Tile is blocked - shake it and deselect any selected tile
@@ -937,40 +1017,32 @@ class MahjongGame:
             tile.is_selected = True
             self.selected_tile = tile
             self.play_sound(self.domino_click1_sound)
+            self.update_face_states()
         elif self.selected_tile == tile:
             # Deselect
             tile.is_selected = False
             self.selected_tile = None
+            self.update_face_states()
         else:
             # Try to match
             self.play_sound(self.domino_click2_sound)
             if self.selected_tile.character_id == tile.character_id:
                 self.play_sound(self.correct_domino_sound)
-                # Match found! Store in history for undo
-                self.move_history.append((self.selected_tile, tile))
-                
-                # Remove both tiles
-                self.tiles.remove(self.selected_tile)
-                self.tiles.remove(tile)
-                del self.tiles_dict[self.selected_tile.pos]
-                del self.tiles_dict[tile.pos]
-                self.selected_tile = None
-                self.matches_made += 1
-                
-                # Check win condition
-                if len(self.tiles) == 0:
-                    self.play_sound(self.level_win_sound)
-                    self.game_state = LEVEL_COMPLETE
-                else:
-                    self.update_moves_count()
-                    # Check if no more moves (and no mix available)
-                    if self.moves_left == 0 and self.mixes_left == 0:
-                        self.game_state = GAME_OVER
+                # Match found! keep both up briefly, then remove
+                tile.is_selected = True
+                tile.set_face_state(True, animate=True)
+                self.selected_tile.set_face_state(True, animate=True)
+                self.pending_tiles = (self.selected_tile, tile)
+                self.pending_match = True
+                self.pending_until = pygame.time.get_ticks() + MATCH_REVEAL_DELAY + tile.flip_duration
             else:
                 # No match, switch selection
-                self.selected_tile.is_selected = False
                 tile.is_selected = True
-                self.selected_tile = tile
+                tile.set_face_state(True, animate=True)
+                self.selected_tile.set_face_state(True, animate=True)
+                self.pending_tiles = (self.selected_tile, tile)
+                self.pending_match = False
+                self.pending_until = pygame.time.get_ticks() + MATCH_REVEAL_DELAY + tile.flip_duration
     
     def draw_gradient_rect(self, surface: pygame.Surface, rect: pygame.Rect, 
                           color1: Tuple[int, int, int], color2: Tuple[int, int, int]):
@@ -1310,7 +1382,7 @@ class MahjongGame:
         max_z = max(tile.pos.z for tile in self.tiles)
         for tile in sorted_tiles:
             is_hovered = (tile == self.hovered_tile)
-            tile.draw(self.screen, self.tiles_dict, is_hovered, max_z)
+            tile.draw(self.screen, self.tiles_dict, is_hovered, max_z, self.face_down_image)
         
     def draw_level_complete(self):
         """Draw level complete screen"""
@@ -1421,6 +1493,40 @@ class MahjongGame:
         self.retry_button.draw(self.screen, self.button_font, self.button_font)
         self.menu_button.draw(self.screen, self.small_font, self.small_font)
         
+    def update_pending_match(self):
+        if not self.pending_tiles:
+            return
+        if pygame.time.get_ticks() < self.pending_until:
+            return
+        tile1, tile2 = self.pending_tiles
+        if self.pending_match:
+            # Match found! Store in history for undo
+            self.move_history.append((tile1, tile2))
+            if tile1 in self.tiles:
+                self.tiles.remove(tile1)
+                del self.tiles_dict[tile1.pos]
+            if tile2 in self.tiles:
+                self.tiles.remove(tile2)
+                del self.tiles_dict[tile2.pos]
+            self.matches_made += 1
+        else:
+            # Mismatch: clear selection
+            if tile1 in self.tiles:
+                tile1.is_selected = False
+            if tile2 in self.tiles:
+                tile2.is_selected = False
+        self.selected_tile = None
+        self.pending_tiles = None
+        self.pending_match = False
+        self.pending_until = 0
+        if len(self.tiles) == 0:
+            self.play_sound(self.level_win_sound)
+            self.game_state = LEVEL_COMPLETE
+        else:
+            self.update_moves_count()
+            self.update_face_states()
+            if self.moves_left == 0 and self.mixes_left == 0:
+                self.game_state = GAME_OVER
     def run(self):
         """Main game loop"""
         while self.running:
@@ -1482,6 +1588,7 @@ class MahjongGame:
             elif self.game_state == LEVEL_SELECT:
                 self.draw_level_select()
             elif self.game_state == PLAYING:
+                self.update_pending_match()
                 self.draw_game_screen()
             elif self.game_state == LEVEL_COMPLETE:
                 self.draw_level_complete()
