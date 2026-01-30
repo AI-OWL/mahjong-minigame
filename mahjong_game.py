@@ -1,4 +1,5 @@
 import pygame
+import math
 import random
 import os
 import sys
@@ -422,6 +423,7 @@ class MahjongGame:
         # Load resources
         self.load_dominos()
         self.load_backgrounds()
+        self.load_ui_images()
         self.load_sounds()
         
         # Levels with updated names
@@ -431,6 +433,8 @@ class MahjongGame:
             Level("Diamond Peaks", self.create_dragon_layout, "Hard")
         ]
         self.current_level_index = 0
+        self.max_unlocked_level = 0
+        self.lock_shake_until = [0 for _ in self.levels]
         
         # Game state
         self.tiles: List[Tile] = []
@@ -484,8 +488,8 @@ class MahjongGame:
         self.retry_button = Button(center_x + 40, 500, 280, 80, "RETRY", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
         self.menu_button = Button(center_x - 140, 610, 280, 70, "MENU", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
 
-        # Mute button (top-right, all screens)
-        self.mute_button = Button(WINDOW_WIDTH - 180, 20, 140, 50, "MUTE", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
+        # Mute button (top-right, home + in-game)
+        self.mute_button = Button(WINDOW_WIDTH - 240, 15, 200, 80, "MUTE", BUTTON_SECONDARY, BUTTON_PRIMARY_HOVER, self)
         
     def load_fonts(self):
         """Load custom fonts"""
@@ -557,6 +561,24 @@ class MahjongGame:
         except Exception as e:
             print(f"Error loading textBG.png: {e}")
             self.text_background_original = None
+
+    def load_ui_images(self):
+        """Load UI icon images"""
+        self.volume_icon = None
+        self.mute_icon = None
+        images_path = Path("src/Images")
+        try:
+            volume_path = images_path / "Volume.png"
+            if volume_path.exists():
+                self.volume_icon = pygame.image.load(str(volume_path)).convert_alpha()
+        except Exception as e:
+            print(f"Error loading Volume.png: {e}")
+        try:
+            mute_path = images_path / "Mute.png"
+            if mute_path.exists():
+                self.mute_icon = pygame.image.load(str(mute_path)).convert_alpha()
+        except Exception as e:
+            print(f"Error loading Mute.png: {e}")
     
     def create_gradient_background(self):
         """Create gradient background as fallback"""
@@ -622,7 +644,7 @@ class MahjongGame:
                 break
 
     def play_sound(self, sound):
-        if sound and not self.is_muted:
+        if sound:
             try:
                 sound.play()
             except Exception:
@@ -634,18 +656,39 @@ class MahjongGame:
         self.is_muted = not self.is_muted
         if self.is_muted:
             pygame.mixer.music.set_volume(0.0)
-            for s in (self.domino_click1_sound, self.domino_click2_sound, self.incorrect_domino_sound, self.correct_domino_sound, self.level_win_sound, self.button_press_sound):
-                if s:
-                    s.set_volume(0.0)
         else:
             pygame.mixer.music.set_volume(self.music_volume)
-            for s in (self.domino_click1_sound, self.domino_click2_sound, self.incorrect_domino_sound, self.correct_domino_sound, self.level_win_sound, self.button_press_sound):
-                if s:
-                    s.set_volume(self.sound_volume)
 
     def draw_mute_button(self):
-        self.mute_button.text = "UNMUTE" if self.is_muted else "MUTE"
-        self.mute_button.draw(self.screen, self.tiny_font, self.tiny_font)
+        icon = self.mute_icon if self.is_muted else self.volume_icon
+        if not icon:
+            self.mute_button.text = "UNMUTE" if self.is_muted else "MUTE"
+            self.mute_button.draw(self.screen, self.tiny_font, self.tiny_font)
+            return
+
+        # Icon-only button
+        rect = self.mute_button.rect
+        scale = 1.12 if self.mute_button.is_hovered else 1.0
+        icon_size = int(min(rect.width, rect.height) * 1.0 * scale)
+        icon_size = max(icon_size, 1)
+        icon_surf = pygame.transform.smoothscale(icon, (icon_size, icon_size))
+        icon_mask = pygame.mask.from_surface(icon_surf)
+        base_glow = icon_mask.to_surface(setcolor=(255, 235, 180, 1), unsetcolor=(0, 0, 0, 0)).convert_alpha()
+        glow_layers = [
+            (1.55, 70),
+            (1.35, 110),
+            (1.18, 150),
+        ]
+        if self.mute_button.is_hovered:
+            glow_layers = [(scale * 1.1, min(alpha + 30, 200)) for scale, alpha in glow_layers]
+        for scale_factor, alpha in glow_layers:
+            glow_size = int(icon_size * scale_factor)
+            glow_surface = pygame.transform.smoothscale(base_glow, (glow_size, glow_size))
+            glow_surface.set_alpha(alpha)
+            glow_rect = glow_surface.get_rect(center=rect.center)
+            self.screen.blit(glow_surface, glow_rect)
+        icon_rect = icon_surf.get_rect(center=rect.center)
+        self.screen.blit(icon_surf, icon_rect)
     
     def load_dominos(self):
         """Load domino images from dominos folder"""
@@ -911,6 +954,7 @@ class MahjongGame:
         """Start a specific level"""
         self.current_level_index = level_index
         level = self.levels[level_index]
+        self.elapsed_time = 0
         positions = level.layout_function()
         self.create_tiles_from_layout(positions)
         self.start_time = pygame.time.get_ticks()
@@ -1117,6 +1161,36 @@ class MahjongGame:
         
         # Draw play button with smaller text
         self.play_button.draw(self.screen, self.small_font, self.small_font)
+        self.draw_mute_button()
+    
+    def draw_lock_icon(self, center_x: int, center_y: int, size: int, color: Tuple[int, int, int]):
+        """Draw a simple lock icon"""
+        size = max(size, 10)
+        body_w = int(size * 0.6)
+        body_h = int(size * 0.5)
+        body_rect = pygame.Rect(
+            center_x - body_w // 2,
+            center_y - body_h // 2 + int(size * 0.15),
+            body_w,
+            body_h
+        )
+        pygame.draw.rect(self.screen, color, body_rect, border_radius=int(body_w * 0.2))
+
+        shackle_w = int(body_w * 0.7)
+        shackle_h = int(size * 0.45)
+        shackle_rect = pygame.Rect(
+            center_x - shackle_w // 2,
+            body_rect.y - shackle_h + int(size * 0.12),
+            shackle_w,
+            shackle_h
+        )
+        pygame.draw.rect(
+            self.screen,
+            color,
+            shackle_rect,
+            width=max(2, int(size * 0.08)),
+            border_radius=shackle_w // 2
+        )
         
     def draw_level_select(self):
         """Draw level selection screen"""
@@ -1143,22 +1217,42 @@ class MahjongGame:
         
         # Level buttons - use textBG for larger backgrounds
         for i, (btn, level) in enumerate(zip(self.level_buttons, self.levels)):
+            is_locked = i > self.max_unlocked_level
+            if is_locked:
+                btn.is_hovered = False
+            shake_offset = 0
+            if is_locked and i < len(self.lock_shake_until):
+                now = pygame.time.get_ticks()
+                if now < self.lock_shake_until[i]:
+                    shake_offset = int(math.sin(now * 0.05) * 6)
             # Draw text background (textBG) instead of buttonBG
             if self.text_background_original:
                 level_bg_width = btn.rect.width + 60
                 level_bg_height = btn.rect.height + 40
                 level_bg = pygame.transform.smoothscale(self.text_background_original, (level_bg_width, level_bg_height))
-                level_bg_x = btn.rect.centerx - level_bg_width // 2
+                level_bg_x = btn.rect.centerx - level_bg_width // 2 + shake_offset
                 level_bg_y = btn.rect.centery - level_bg_height // 2
                 
                 # Apply brightness if hovered - subtle warm glow
-                if btn.is_hovered:
+                if btn.is_hovered and not is_locked:
                     level_bg = level_bg.copy()
                     bright_overlay = pygame.Surface((level_bg_width, level_bg_height), pygame.SRCALPHA)
                     bright_overlay.fill((255, 220, 150, 30))
                     level_bg.blit(bright_overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
                 
                 self.screen.blit(level_bg, (level_bg_x, level_bg_y))
+            
+            if is_locked:
+                lock_color = (200, 200, 200)
+                lock_text = self.small_font.render("LOCKED", True, lock_color)
+                lock_shadow = self.small_font.render("LOCKED", True, (0, 0, 0))
+                lock_shadow.set_alpha(200)
+                lock_x = btn.rect.centerx - lock_text.get_width() // 2 + shake_offset
+                lock_y = btn.rect.centery - lock_text.get_height() // 2 + 18
+                self.draw_lock_icon(btn.rect.centerx + shake_offset, btn.rect.centery - 22, 50, lock_color)
+                self.screen.blit(lock_shadow, (lock_x + 2, lock_y + 2))
+                self.screen.blit(lock_text, (lock_x, lock_y))
+                continue
             
             # Level info on button - use Yusei font with shadows
             level_num_label = self.button_font.render("LEVEL ", True, TEXT_WHITE)
@@ -1319,6 +1413,7 @@ class MahjongGame:
         
         # Back button at top right - smaller text
         self.back_button.draw(self.screen, self.tiny_font, self.tiny_font)
+        self.draw_mute_button()
         
         # Calculate tile positions - dynamically center based on actual pixel bounds
         if self.tiles:
@@ -1457,41 +1552,58 @@ class MahjongGame:
         pygame.draw.rect(overlay, OVERLAY, overlay.get_rect())
         self.screen.blit(overlay, (0, 0))
         
-        # Game Over with background
-        title = self.title_font.render("NO MORE MOVES!", True, (255, 100, 100))
-        title_shadow = self.title_font.render("NO MORE MOVES!", True, (0, 0, 0))
+        # Out of moves title (same styling as win screen)
+        title = self.subtitle_font.render("OUT OF MOVES!", True, TEXT_WHITE)
+        title_shadow = self.subtitle_font.render("OUT OF MOVES!", True, (0, 0, 0))
         
         if self.text_background_original:
             title_bg_width = title.get_width() + 120
             title_bg_height = title.get_height() + 40
             title_bg = pygame.transform.smoothscale(self.text_background_original, (title_bg_width, title_bg_height))
             title_bg_x = WINDOW_WIDTH // 2 - title_bg_width // 2
-            self.screen.blit(title_bg, (title_bg_x, 180))
-            self.screen.blit(title_shadow, (WINDOW_WIDTH // 2 - title.get_width() // 2 + 3, 203))
-            self.screen.blit(title, (WINDOW_WIDTH // 2 - title.get_width() // 2, 200))
+            self.screen.blit(title_bg, (title_bg_x, 130))
+            self.screen.blit(title_shadow, (WINDOW_WIDTH // 2 - title.get_width() // 2 + 3, 153))
+            self.screen.blit(title, (WINDOW_WIDTH // 2 - title.get_width() // 2, 150))
         else:
-            self.screen.blit(title_shadow, (WINDOW_WIDTH // 2 - title.get_width() // 2 + 3, 203))
-            self.screen.blit(title, (WINDOW_WIDTH // 2 - title.get_width() // 2, 200))
+            self.screen.blit(title_shadow, (WINDOW_WIDTH // 2 - title.get_width() // 2 + 3, 153))
+            self.screen.blit(title, (WINDOW_WIDTH // 2 - title.get_width() // 2, 150))
         
-        # Message with background and shadow
-        message = self.game_font.render("Try again or choose a different level", True, TEXT_WHITE)
-        message_shadow = self.game_font.render("Try again or choose a different level", True, (0, 0, 0))
-        message_shadow.set_alpha(200)
+        # Stats with backgrounds - match win screen layout
+        stats_data = [
+            ("Time: ", f"{self.elapsed_time} seconds"),
+            ("Matches: ", f"{self.matches_made}"),
+            ("Level: ", self.levels[self.current_level_index].name)
+        ]
+        y = 300
+        for label, value in stats_data:
+            label_text = self.game_font.render(label, True, TEXT_WHITE)
+            label_shadow = self.game_font.render(label, True, (0, 0, 0))
+            label_shadow.set_alpha(200)
+            value_text = self.game_font.render(value, True, TEXT_WHITE)
+            value_shadow = self.game_font.render(value, True, (0, 0, 0))
+            value_shadow.set_alpha(200)
+            
+            combined_width = label_text.get_width() + value_text.get_width()
+            
+            # Draw background
+            if self.text_background_original:
+                stat_bg_width = combined_width + 100
+                stat_bg_height = max(label_text.get_height(), value_text.get_height()) + 30
+                stat_bg = pygame.transform.smoothscale(self.text_background_original, (stat_bg_width, stat_bg_height))
+                stat_bg_x = WINDOW_WIDTH // 2 - stat_bg_width // 2
+                self.screen.blit(stat_bg, (stat_bg_x, y - 10))
+            
+            # Draw text with shadows
+            start_x = WINDOW_WIDTH // 2 - combined_width // 2
+            self.screen.blit(label_shadow, (start_x + 2, y + 2))
+            self.screen.blit(label_text, (start_x, y))
+            self.screen.blit(value_shadow, (start_x + label_text.get_width() + 2, y + 2))
+            self.screen.blit(value_text, (start_x + label_text.get_width(), y))
+            y += 70
         
-        if self.text_background_original:
-            msg_bg_width = message.get_width() + 100
-            msg_bg_height = message.get_height() + 30
-            msg_bg = pygame.transform.smoothscale(self.text_background_original, (msg_bg_width, msg_bg_height))
-            msg_bg_x = WINDOW_WIDTH // 2 - msg_bg_width // 2
-            self.screen.blit(msg_bg, (msg_bg_x, 310))
-        
-        msg_x = WINDOW_WIDTH // 2 - message.get_width() // 2
-        self.screen.blit(message_shadow, (msg_x + 2, 322))
-        self.screen.blit(message, (msg_x, 320))
-        
-        # Buttons
-        self.retry_button.draw(self.screen, self.button_font, self.button_font)
-        self.menu_button.draw(self.screen, self.small_font, self.small_font)
+        # Buttons (same sizing as win screen)
+        self.retry_button.draw(self.screen, self.tiny_font, self.tiny_font)
+        self.menu_button.draw(self.screen, self.tiny_font, self.tiny_font)
         
     def update_pending_match(self):
         if not self.pending_tiles:
@@ -1521,6 +1633,7 @@ class MahjongGame:
         self.pending_until = 0
         if len(self.tiles) == 0:
             self.play_sound(self.level_win_sound)
+            self.max_unlocked_level = max(self.max_unlocked_level, self.current_level_index + 1)
             self.game_state = LEVEL_COMPLETE
         else:
             self.update_moves_count()
@@ -1536,6 +1649,8 @@ class MahjongGame:
                     
                 # Handle events based on game state
                 if self.game_state == HOME_SCREEN:
+                    if self.mute_button.handle_event(event):
+                        self.toggle_mute()
                     if self.play_button.handle_event(event):
                         self.game_state = LEVEL_SELECT
                         
@@ -1545,11 +1660,22 @@ class MahjongGame:
                         self.game_state = HOME_SCREEN
                     else:
                         for i, btn in enumerate(self.level_buttons):
-                            if btn.handle_event(event):
-                                self.start_level(i)
+                            if i <= self.max_unlocked_level:
+                                if btn.handle_event(event):
+                                    self.start_level(i)
+                            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                                if btn.rect.collidepoint(event.pos):
+                                    self.play_sound(self.incorrect_domino_sound)
+                                    if i < len(self.lock_shake_until):
+                                        self.lock_shake_until[i] = pygame.time.get_ticks() + 300
                             
                 elif self.game_state == PLAYING:
-                    if self.back_button.handle_event(event):
+                    if self.mute_button.handle_event(event):
+                        self.toggle_mute()
+                    elif self.back_button.handle_event(event):
+                        self.elapsed_time = 0
+                        self.moves_left = 0
+                        self.start_time = 0
                         self.game_state = LEVEL_SELECT
                     elif self.hint_button.handle_event(event):
                         self.show_hint()
@@ -1574,12 +1700,18 @@ class MahjongGame:
                     if self.retry_button.handle_event(event):
                         self.start_level(self.current_level_index)
                     if self.menu_button.handle_event(event):
+                        self.elapsed_time = 0
+                        self.moves_left = 0
+                        self.start_time = 0
                         self.game_state = LEVEL_SELECT
                         
                 elif self.game_state == GAME_OVER:
                     if self.retry_button.handle_event(event):
                         self.start_level(self.current_level_index)
                     if self.menu_button.handle_event(event):
+                        self.elapsed_time = 0
+                        self.moves_left = 0
+                        self.start_time = 0
                         self.game_state = LEVEL_SELECT
             
             # Draw current screen
